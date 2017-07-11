@@ -4,83 +4,112 @@ import gzip
 import pwd
 import json
 
+
 def find_previous_log_file():
-    return max(glob.glob('/var/log/maillog-*.gz'))
+    try:
+        return max(glob.glob('/var/log/maillog-*.gz'))
+    except ValueError:
+        return None
+
 
 def log_stream(regular_file, gzip_file):
+    if gzip_file:
+        for line in gzip.open(gzip_file):
+            yield line
     for line in open(regular_file):
         yield line
-    for line in gzip.open(gzip_file):
-        yield line
 
-def extract_queued_as(line):
-    return line.split('queued as ')[1][:-2]
 
-def lines_with_ids(ids, log_file, line_parser):
+def read_statuses(f):
+    result = {}
+    for line in f:
+        terms = line.split()[:3]
+        result[terms[0]] = terms[1]
+    return result
+
+
+def find_uids(ids, log_file):
     bids = frozenset(ids)
+    uids = {}
+    result = {}
     for line in log_file:
         try:
-            connection_id = line_parser(line)
-            if connection_id in bids:
-                yield line
+            mail_id = line.split(':', 5)[3].strip()
         except IndexError:
             continue
 
-def find_ids(lines):
-    for line in lines:
-        yield line.split(':', 5)[3].strip()
-
-def extract_uid(line):
-    if 'uid=' not in line:
-        raise IndexError(0)
-    return line.split(':', 5)[3].strip()
-
-def find_uids(lines):
-    for line in lines:
-        yield line.split('uid=')[1].split()[0]
-
-def lookup_binding_ids(uids):
-    for uid in uids:
         try:
-            yield pwd.getpwuid(int(uid)).pw_name
-        except KeyError:
-            continue
-
-def lookup_site_infos(binding_ids):
-    cache = {}
-    for binding_id in binding_ids:
-        try:
-            yield cache[binding_id]
-        except KeyError:
+            uids[mail_id] = line.split('uid=')[1].split()[0]
+        except IndexError:
             pass
         else:
             continue
+
+        try:
+            queued_id = line.split('queued as ')[1][:-2]
+        except IndexError:
+            continue
+
+        if queued_id not in ids:
+            continue
+
+        try:
+            result[queued_id] = uids[mail_id]
+        except KeyError:
+            continue
+
+    return result
+
+
+def lookup_bindings(uids):
+    result = {}
+    cache = {}
+    for mail_id, uid in uids.iteritems():
+        try:
+            binding_id = cache[uid]
+        except KeyError:
+            try:
+                cache[uid] = binding_id = pwd.getpwuid(int(uid)).pw_name
+            except KeyError:
+                continue
+        result[mail_id] = binding_id
+    return result
+
+
+def lookup_site_infos(binding_ids):
+    result = {}
+    for binding_id in set(binding_ids):
         try:
             j = json.load(open('/srv/bindings/%s/metadata.json' % binding_id))
         except IOError:
             continue
-        cache[binding_id] = output = j.get('service_level', 'unknown'), j['site'], j.get('label', 'empty').encode('utf-8')
-        yield output
+        result[binding_id] = j.get('service_level', 'unknown'), j['site'], j.get('label', 'empty').encode('utf-8')
+    return result
 
-def report_site_infos(site_infos):
-    for info in site_infos:
-        print ' '.join(info)
+
+def report_infos(bindings, statuses, site_infos):
+    for mail_id, status in statuses.iteritems():
+        try:
+            binding = bindings[mail_id]
+        except KeyError:
+            continue
+        try:
+            print ' '.join(site_infos[binding]), status
+        except (UnicodeDecodeError, KeyError):
+            continue
+
 
 def main():
     id_list_file = sys.argv[1]
     main_log_file = '/var/log/maillog'
     previous_log_file = find_previous_log_file()
 
-    original_line_ids = lines_with_ids(open(id_list_file).read().split('\n'), log_stream(main_log_file, previous_log_file), extract_queued_as)
-    original_ids = find_ids(original_line_ids)
+    statuses = read_statuses(open(id_list_file))
+    uids = find_uids(statuses, log_stream(main_log_file, previous_log_file))
+    bindings = lookup_bindings(uids)
+    site_infos = lookup_site_infos(bindings.itervalues())
 
-    uid_lines = lines_with_ids(original_ids, log_stream(main_log_file, previous_log_file), extract_uid)
-    uids = find_uids(uid_lines)
-
-    binding_ids = lookup_binding_ids(uids)
-    site_infos = lookup_site_infos(binding_ids)
-
-    report_site_infos(site_infos)
+    report_infos(bindings, statuses, site_infos)
 
 if __name__ == '__main__':
     main()
